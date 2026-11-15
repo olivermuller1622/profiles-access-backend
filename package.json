@@ -1,0 +1,16 @@
+{
+  "name": "profiles-access-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Session access backend service",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
