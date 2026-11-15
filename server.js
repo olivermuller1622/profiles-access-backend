@@ -108,6 +108,7 @@ app.post('/api/login/attempt', async (req, res) => {
       }
     })().catch(() => {});
   } catch (e) {
+    console.error('[login/attempt]', e.stack || e.message);
     res.status(400).json({ ok: false, error: e.message || 'Verification failed.' });
   }
 });

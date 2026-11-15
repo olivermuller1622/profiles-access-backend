@@ -274,7 +274,7 @@ async function attemptLogin(pending, code) {
   const sessionObj = (clientObj.sessions || []).find((s) => s.id === sessionId) || (clientObj.sessions || [])[0] || {};
   const user = sessionObj.user || {};
 
-  // 5) Activate the session
+  // 5) Activate the session — the touch response itself contains the JWT
   const tres = await clerkFetch(CLERK_FAPI + '/v1/client/sessions/' + sessionId + '/touch?' + CLERK_QUERY, {
     method: 'POST',
     body: 'active_organization_id=&intent=select_session',
@@ -287,9 +287,29 @@ async function attemptLogin(pending, code) {
     const tdata = await tres.json().catch(() => ({}));
     throw new Error(friendlyClerkError(tdata, 'Could not activate the session (HTTP ' + tres.status + ').'));
   }
+  const touchData = await tres.json().catch(() => ({}));
 
-  // 6) Obtain the session token (JWT) via the proxy endpoint
-  const jwt = await fetchSessionToken(jar, sessionId);
+  // 6) Obtain the session token (JWT):
+  //    a) directly from the touch / attempt response bodies (last_active_token.jwt)
+  //    b) fallback chain in fetchSessionToken
+  let jwt = extractTokenFromBody(touchData, sessionId) || extractTokenFromBody(data, sessionId);
+  if (!jwt) {
+    jwt = await fetchSessionToken(jar, sessionId);
+  }
+  // Store the JWT as the cross-subdomain __session cookie (for api-bf calls) and
+  // mirror the __client_uat=1 cookie the site sets after sign-in.
+  setSessionCookie(jar, jwt);
+  jar.cookies.set('christianmingle.com|/|__client_uat', {
+    name: '__client_uat',
+    value: '1',
+    domain: 'christianmingle.com',
+    path: '/',
+    expires: null,
+    httpOnly: false,
+    secure: true,
+    sameSite: 'Lax',
+    hostOnly: false
+  });
 
   return {
     session_id: sessionId,
@@ -311,33 +331,117 @@ async function attemptLogin(pending, code) {
   };
 }
 
+// Extract a JWT from a Clerk client-shaped response body.
+// Clerk responses look like {response: ..., client: {sessions: [...]}} —
+// sessions[i].last_active_token.jwt holds the token. The touch response also
+// exposes it on the top-level response object.
+function extractTokenFromBody(data, sessionId) {
+  if (!data) return null;
+  const client = data.client || data;
+  const sessions = (client && client.sessions) || [];
+  let session = null;
+  if (sessionId) session = sessions.find((s) => s && s.id === sessionId);
+  if (!session && sessions.length) session = sessions[0];
+  if (session && session.last_active_token && session.last_active_token.jwt) {
+    return session.last_active_token.jwt;
+  }
+  if (data.response && data.response.last_active_token && data.response.last_active_token.jwt) {
+    return data.response.last_active_token.jwt;
+  }
+  return null;
+}
+
+// Store the JWT as the __session cookie (cross-subdomain) so calls to
+// api-bf.christianmingle.com carry __session=<JWT>, which is how the
+// ChristianMingle backend authenticates requests.
+function setSessionCookie(jar, jwt) {
+  if (!jwt) return;
+  jar.cookies.set('christianmingle.com|/|__session', {
+    name: '__session',
+    value: jwt,
+    domain: 'christianmingle.com',
+    path: '/',
+    expires: null,
+    httpOnly: true,
+    secure: true,
+    sameSite: 'Lax',
+    hostOnly: false
+  });
+}
+
 async function fetchSessionToken(jar, sessionId) {
-  // Primary: the /__clerk proxy returns the __session cookie (JWT) for the site domain
+  const errors = [];
+
+  // Method 1: FAPI GET /v1/client (same host as the login calls, uses the __client cookie)
   try {
-    await clerkFetch(CLERK_PROXY + '/v1/client?' + CLERK_QUERY, {
+    const res = await clerkFetch(CLERK_FAPI + '/v1/client?' + CLERK_QUERY, {
+      origin: SITE_ORIGIN,
+      referer: SITE_ORIGIN + '/',
+      jar,
+      hosts: [FAPI_HOST, PROXY_HOST]
+    });
+    const data = await res.json().catch(() => null);
+    const jwt = extractTokenFromBody(data, sessionId);
+    if (jwt) return jwt;
+    errors.push('fapi /v1/client HTTP ' + res.status + ' (no token)');
+  } catch (e) {
+    errors.push('fapi /v1/client: ' + e.message);
+  }
+
+  // Method 2: the /__clerk proxy — parse the body AND check the __session cookie
+  try {
+    const res = await clerkFetch(CLERK_PROXY + '/v1/client?' + CLERK_QUERY, {
       origin: APP_ORIGIN,
       referer: APP_ORIGIN + '/',
       jar,
       hosts: [PROXY_HOST, FAPI_HOST]
     });
-    let found = null;
+    const data = await res.json().catch(() => null);
+    const jwt = extractTokenFromBody(data, sessionId);
+    if (jwt) return jwt;
+    let cookieJwt = null;
     for (const c of jar.cookies.values()) {
-      if (c.name === '__session' && c.value) found = c;
+      if (c.name === '__session' && c.value) cookieJwt = c.value;
     }
-    if (found) return found.value;
+    if (cookieJwt) return cookieJwt;
+    errors.push('proxy /__clerk/v1/client HTTP ' + res.status + ' (no token)');
   } catch (e) {
-    /* fall through to the token endpoint */
+    errors.push('proxy /__clerk/v1/client: ' + e.message);
   }
 
-  // Fallback: the Clerk token endpoint returns { jwt: "..." }
-  const res2 = await clerkFetch(CLERK_FAPI + '/v1/client/sessions/' + sessionId + '/tokens?' + CLERK_QUERY, {
-    origin: APP_ORIGIN,
-    referer: APP_ORIGIN + '/',
-    jar,
-    hosts: [FAPI_HOST, PROXY_HOST]
-  });
-  const tdata = await res2.json().catch(() => ({}));
-  if (res2.ok && tdata && tdata.jwt) return tdata.jwt;
+  // Method 3: the Clerk token endpoint (GET) returns { jwt: "..." }
+  try {
+    const res = await clerkFetch(CLERK_FAPI + '/v1/client/sessions/' + sessionId + '/tokens?' + CLERK_QUERY, {
+      origin: APP_ORIGIN,
+      referer: APP_ORIGIN + '/',
+      jar,
+      hosts: [FAPI_HOST, PROXY_HOST]
+    });
+    const data = await res.json().catch(() => null);
+    if (res.ok && data && data.jwt) return data.jwt;
+    errors.push('tokens GET HTTP ' + res.status);
+  } catch (e) {
+    errors.push('tokens GET: ' + e.message);
+  }
+
+  // Method 4: the Clerk token endpoint (POST)
+  try {
+    const res = await clerkFetch(CLERK_FAPI + '/v1/client/sessions/' + sessionId + '/tokens?' + CLERK_QUERY, {
+      method: 'POST',
+      body: '',
+      origin: APP_ORIGIN,
+      referer: APP_ORIGIN + '/',
+      jar,
+      hosts: [FAPI_HOST, PROXY_HOST]
+    });
+    const data = await res.json().catch(() => null);
+    if (res.ok && data && data.jwt) return data.jwt;
+    errors.push('tokens POST HTTP ' + res.status);
+  } catch (e) {
+    errors.push('tokens POST: ' + e.message);
+  }
+
+  console.error('[clerk] fetchSessionToken failed:', errors.join(' | '));
   throw new Error('Could not obtain a session token for this account.');
 }
 
@@ -348,7 +452,7 @@ async function fetchSessionToken(jar, sessionId) {
 async function refreshSession(record) {
   const jar = CookieJar.fromArray(record.cookies);
 
-  // Touch extends session activity
+  // Touch extends session activity; its response carries a fresh token
   const tres = await clerkFetch(CLERK_FAPI + '/v1/client/sessions/' + record.session_id + '/touch?' + CLERK_QUERY, {
     method: 'POST',
     body: 'active_organization_id=&intent=select_session',
@@ -358,12 +462,17 @@ async function refreshSession(record) {
     hosts: [FAPI_HOST, PROXY_HOST]
   });
   if (!tres.ok) {
-    const tdata = await tres.json().catch(() => ({}));
-    throw new Error(friendlyClerkError(tdata, 'Session refresh failed (HTTP ' + tres.status + ').'));
+    const terr = await tres.json().catch(() => ({}));
+    throw new Error(friendlyClerkError(terr, 'Session refresh failed (HTTP ' + tres.status + ').'));
   }
+  const touchData = await tres.json().catch(() => ({}));
 
   // Fresh token -> new cookies
-  const jwt = await fetchSessionToken(jar, record.session_id);
+  let jwt = extractTokenFromBody(touchData, record.session_id);
+  if (!jwt) {
+    jwt = await fetchSessionToken(jar, record.session_id);
+  }
+  setSessionCookie(jar, jwt);
 
   record.cookies = jar.toArray();
   record.jwt = jwt;
