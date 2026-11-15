@@ -133,6 +133,55 @@ app.get('/api/sessions/:id/cookies', (req, res) => {
   res.json({ ok: true, cookies: r.cookies, cookie_header: clerk.cookieHeaderFor(r) });
 });
 
+// Export cookies in Cookie-Editor (browser extension) import format.
+// Refreshes the session first so the exported __session JWT is fresh.
+app.get('/api/sessions/:id/export', async (req, res) => {
+  const r = store.get(req.params.id);
+  if (!r) return res.status(404).json({ ok: false, error: 'Session not found' });
+  let refreshed = false;
+  try {
+    await clerk.refreshSession(r);
+    store.save();
+    refreshed = true;
+  } catch (e) {
+    r.status = 'EXPIRED';
+    store.save();
+  }
+  const mapSameSite = (v) => {
+    const s = String(v || '').toLowerCase();
+    if (s === 'lax') return 'lax';
+    if (s === 'none' || s === 'no_restriction') return 'no_restriction';
+    if (s === 'strict') return 'strict';
+    return 'unspecified';
+  };
+  const cookies = (r.cookies || []).map((c) => ({
+    name: c.name,
+    value: c.value,
+    domain: c.hostOnly ? c.domain : '.' + c.domain,
+    path: c.path || '/',
+    expirationDate: c.expires ? Math.floor(Date.parse(c.expires) / 1000) : null,
+    session: !c.expires,
+    hostOnly: !!c.hostOnly,
+    httpOnly: !!c.httpOnly,
+    secure: !!c.secure,
+    sameSite: mapSameSite(c.sameSite),
+    storeId: null
+  }));
+  const safeEmail = String(r.email || 'account').split('@')[0].replace(/[^a-z0-9._-]/gi, '_');
+  res.json({
+    ok: true,
+    format: 'cookie-editor',
+    email: r.email,
+    session_id: r.session_id,
+    status: r.status,
+    refreshed: refreshed,
+    generated_at: new Date().toISOString(),
+    filename: 'cookies-' + safeEmail + '.json',
+    hint: 'Use the Cookie-Editor browser extension on christianmingle.com: Import -> paste this JSON -> open app.christianmingle.com',
+    cookies
+  });
+});
+
 app.post('/api/sessions/:id/refresh', async (req, res) => {
   const r = store.get(req.params.id);
   if (!r) return res.status(404).json({ ok: false, error: 'Session not found' });

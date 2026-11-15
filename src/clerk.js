@@ -290,9 +290,13 @@ async function attemptLogin(pending, code) {
   const touchData = await tres.json().catch(() => ({}));
 
   // 6) Obtain the session token (JWT):
-  //    a) directly from the touch / attempt response bodies (last_active_token.jwt)
-  //    b) fallback chain in fetchSessionToken
-  let jwt = extractTokenFromBody(touchData, sessionId) || extractTokenFromBody(data, sessionId);
+  //    a) app-audience token from the /__clerk proxy (needed by api-bf)
+  //    b) directly from the touch / attempt response bodies (last_active_token.jwt)
+  //    c) fallback chain in fetchSessionToken
+  let jwt = await fetchAppAudienceToken(jar, sessionId);
+  if (!jwt) {
+    jwt = extractTokenFromBody(touchData, sessionId) || extractTokenFromBody(data, sessionId);
+  }
   if (!jwt) {
     jwt = await fetchSessionToken(jar, sessionId);
   }
@@ -367,6 +371,25 @@ function setSessionCookie(jar, jwt) {
     sameSite: 'Lax',
     hostOnly: false
   });
+}
+
+// Fetch the app-audience token (azp=app.christianmingle.com) from the /__clerk
+// proxy. This is the token the ChristianMingle backend (api-bf) expects in the
+// __session cookie. The token is parsed from the response BODY
+// (client.sessions[].last_active_token.jwt), not from Set-Cookie.
+async function fetchAppAudienceToken(jar, sessionId) {
+  try {
+    const res = await clerkFetch(CLERK_PROXY + '/v1/client?' + CLERK_QUERY, {
+      origin: APP_ORIGIN,
+      referer: APP_ORIGIN + '/',
+      jar,
+      hosts: [PROXY_HOST, FAPI_HOST]
+    });
+    const data = await res.json().catch(() => null);
+    return extractTokenFromBody(data, sessionId);
+  } catch (e) {
+    return null;
+  }
 }
 
 async function fetchSessionToken(jar, sessionId) {
@@ -467,8 +490,11 @@ async function refreshSession(record) {
   }
   const touchData = await tres.json().catch(() => ({}));
 
-  // Fresh token -> new cookies
-  let jwt = extractTokenFromBody(touchData, record.session_id);
+  // Fresh token -> new cookies. Prefer the app-audience token (api-bf compat).
+  let jwt = await fetchAppAudienceToken(jar, record.session_id);
+  if (!jwt) {
+    jwt = extractTokenFromBody(touchData, record.session_id);
+  }
   if (!jwt) {
     jwt = await fetchSessionToken(jar, record.session_id);
   }
